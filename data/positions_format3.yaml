@@ -1,0 +1,52 @@
+report_date: "20250115"
+positions:
+  - account_id: "ACC001"
+    ticker: "AAPL"
+    shares: 100
+    market_value: 18550.00
+    custodian_ref: "CUST_A_12345"
+  - account_id: "ACC001"
+    ticker: "MSFT"
+    shares: 50
+    market_value: 21012.50
+    custodian_ref: "CUST_A_12346"
+  - account_id: "ACC001"
+    ticker: "GOOGL"
+    shares: 100
+    market_value: 14280.00
+    custodian_ref: "CUST_A_12347"
+  - account_id: "ACC002"
+    ticker: "GOOGL"
+    shares: 75
+    market_value: 10710.00
+    custodian_ref: "CUST_B_22345"
+  - account_id: "ACC002"
+    ticker: "AAPL"
+    shares: 200
+    market_value: 37100.00
+    custodian_ref: "CUST_B_22346"
+  - account_id: "ACC002"
+    ticker: "NVDA"
+    shares: 120
+    market_value: 60636.00
+    custodian_ref: "CUST_B_22347"
+  - account_id: "ACC003"
+    ticker: "TSLA"
+    shares: -150
+    market_value: -35767.50
+    custodian_ref: "CUST_A_32345"
+  - account_id: "ACC003"
+    ticker: "NVDA"
+    shares: 80
+    market_value: 40424.00
+    custodian_ref: "CUST_A_32346"
+  - account_id: "ACC004"
+    ticker: "AAPL"
+    shares: 500
+    market_value: 92750.00
+    custodian_ref: "CUST_C_42345"
+  - account_id: "ACC004"
+    ticker: "MSFT"
+    shares: 300
+    market_value: 126075.00
+    custodian_ref: "CUST_C_42346"

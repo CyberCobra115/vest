@@ -1,0 +1,22 @@
+report_date: "20250115"
+positions:
+  - account_id: "ACC001"
+    ticker: "AAPL"
+    shares: 90
+    market_value: 16695.00
+    custodian_ref: "CUST_A_12345"
+  - account_id: "ACC001"
+    ticker: "MSFT"
+    shares: 50
+    market_value: 21012.50
+    custodian_ref: "CUST_A_12346"
+  - account_id: "ACC002"
+    ticker: "AAPL"
+    shares: 250
+    market_value: 46375.00
+    custodian_ref: "CUST_B_22346"
+  - account_id: "ACC002"
+    ticker: "NVDA"
+    shares: 100
+    market_value: 50530.00
+    custodian_ref: "CUST_B_22347"
