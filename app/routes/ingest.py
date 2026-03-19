@@ -17,9 +17,18 @@ def ingest_file():
         return jsonify({"error": "No file or body provided"}), 400
 
     report = ingest(content)
-    status = 200 if (report.rows_accepted > 0 and report.rows_rejected == 0) else 207
-    if report.rows_accepted == 0 and report.rows_rejected == 0 and report.format_detected == "UNKNOWN":
+
+    if report.format_detected == "UNKNOWN":
         status = 400
+    elif report.rows_accepted == 0 and report.rows_rejected > 0:
+        # Every row failed validation — treat as a bad request, not partial success.
+        status = 400
+    elif report.rows_rejected > 0:
+        # Partial success: some rows accepted, some rejected.
+        status = 207
+    else:
+        status = 200
+
     return jsonify(report.to_dict()), status
 
 

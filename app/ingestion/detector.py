@@ -32,7 +32,7 @@ def detect_format(content: str) -> FileFormat:
     if not first_line:
         return FileFormat.UNKNOWN
 
-    if first_line.startswith("report_date:") and "positions:" in content:
+    if first_line.startswith("report_date:"):
         return FileFormat.FORMAT_3
 
     if "|" in first_line:

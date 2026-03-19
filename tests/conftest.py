@@ -14,10 +14,13 @@ def app():
 
 @pytest.fixture(autouse=True)
 def clean_db(app):
-    """Rollback after every test — keeps tests isolated."""
+    """
+    Wipe all rows after every test via DELETE (not rollback) so that tests
+    committing within their own app_context() are also cleaned up.
+    The session-scoped app keeps the schema alive across all tests.
+    """
     with app.app_context():
         yield
-        _db.session.rollback()
         for table in reversed(_db.metadata.sorted_tables):
             _db.session.execute(table.delete())
         _db.session.commit()
@@ -38,6 +41,8 @@ TradeDate,AccountID,Ticker,Quantity,Price,TradeType,SettlementDate
 2025-01-15,ACC003,TSLA,150,238.45,SELL,2025-01-17
 """
 
+# Format 2 is a trade file (pipe-delimited) per the spec.
+# Negative SHARES = SELL fill; positive = BUY fill.
 FORMAT_2_CONTENT = """\
 REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM
 20250115|ACC001|AAPL|100|18550.00|CUSTODIAN_A
