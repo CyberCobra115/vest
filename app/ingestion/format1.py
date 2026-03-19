@@ -44,13 +44,18 @@ def parse(content: str) -> tuple[list[Format1Row], list[dict]]:
             continue
 
         try:
+            trade_type = raw["TradeType"].strip().upper()
+            raw_qty = int(raw["Quantity"])
+            # Quantities are stored signed: positive=BUY, negative=SELL.
+            # This lets SUM(quantity) yield the correct net position directly.
+            signed_qty = raw_qty if trade_type == "BUY" else -raw_qty
             rows.append(Format1Row(
                 trade_date=parse_date(raw["TradeDate"]),
                 account_id=raw["AccountID"].strip(),
                 ticker=raw["Ticker"].strip().upper(),
-                quantity=int(raw["Quantity"]),
+                quantity=signed_qty,
                 price=Decimal(raw["Price"]),
-                trade_type=raw["TradeType"].strip().upper(),
+                trade_type=trade_type,
                 settlement_date=parse_date(raw["SettlementDate"]),
                 _line_number=line_num,
             ))

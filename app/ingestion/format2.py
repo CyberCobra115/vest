@@ -4,7 +4,13 @@ Parser for Trade File Format 2 — pipe-delimited.
 Expected header:
   REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM
 
-Note: negative SHARES indicates short positions.
+This is a second trade file format (per the spec: "ingest files of two
+different formats for daily trades into a single relational database table").
+SHARES maps to quantity (signed: negative = SELL fill).
+MARKET_VALUE is used to derive the per-share price = MARKET_VALUE / SHARES.
+SOURCE_SYSTEM identifies the originating custodian.
+
+Dates are compact YYYYMMDD.
 """
 
 import csv
@@ -18,11 +24,13 @@ from app.ingestion.utils import parse_date, ParseError
 
 @dataclass
 class Format2Row:
-    report_date: date
+    trade_date: date
     account_id: str
     ticker: str
-    shares: int          # negative = short
-    market_value: Decimal
+    # Signed quantity: negative shares = SELL fill.
+    quantity: int
+    price: Decimal       # derived: abs(market_value) / abs(shares)
+    trade_type: str      # "BUY" if shares > 0, "SELL" if shares < 0
     source_system: str
     _line_number: int = 0
 
@@ -40,12 +48,31 @@ def parse(content: str) -> tuple[list[Format2Row], list[dict]]:
             continue
 
         try:
+            shares = int(raw["SHARES"])
+            market_value = Decimal(raw["MARKET_VALUE"])
+
+            if shares == 0:
+                errors.append({
+                    "line": line_num,
+                    "field": "SHARES",
+                    "value": raw["SHARES"],
+                    "reason": "SHARES must be non-zero",
+                })
+                continue
+
+            # Derive per-share price from fill notional; always positive.
+            price = abs(market_value) / abs(Decimal(shares))
+            trade_type = "BUY" if shares > 0 else "SELL"
+            # Stored signed so SUM(quantity) yields correct net position.
+            signed_qty = shares  # already signed from source
+
             rows.append(Format2Row(
-                report_date=parse_date(raw["REPORT_DATE"]),
+                trade_date=parse_date(raw["REPORT_DATE"]),
                 account_id=raw["ACCOUNT_ID"].strip(),
                 ticker=raw["SECURITY_TICKER"].strip().upper(),
-                shares=int(raw["SHARES"]),
-                market_value=Decimal(raw["MARKET_VALUE"]),
+                quantity=signed_qty,
+                price=price,
+                trade_type=trade_type,
                 source_system=raw["SOURCE_SYSTEM"].strip(),
                 _line_number=line_num,
             ))
