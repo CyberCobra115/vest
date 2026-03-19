@@ -1,12 +1,13 @@
 """
-Tests specifically for Requirement 3: data ingestion quality checks.
+Tests specifically for data ingestion quality checks.
 
 Covers:
   - Settlement date before trade date (Format 1)
+  - SELL quantity stored as negative (both Format 1 and Format 2)
   - Intra-file duplicate detection (all formats)
-  - Cross-file duplicate detection / skip on reingest (Format 1)
-  - Position upsert: changed values update in place (Format 2 & 3)
-  - Position upsert: unchanged values skipped with warning (Format 2 & 3)
+  - Cross-file duplicate detection / skip on reingest
+  - Position upsert: changed values update in place (Format 3)
+  - Position upsert: unchanged values skipped with warning (Format 3)
 """
 
 from datetime import date
@@ -40,6 +41,18 @@ class TestFormat1QualityChecks:
             report = ingest(content)
         assert report.rows_accepted == 1
         assert report.rows_rejected == 0
+
+    def test_sell_stored_with_negative_quantity(self, app):
+        """SELL must be persisted with negative quantity."""
+        content = (
+            "TradeDate,AccountID,Ticker,Quantity,Price,TradeType,SettlementDate\n"
+            "2025-01-15,ACC001,TSLA,150,238.45,SELL,2025-01-17\n"
+        )
+        with app.app_context():
+            ingest(content)
+            trade = db.session.query(Trade).filter_by(ticker="TSLA").first()
+            assert trade.quantity == -150
+            assert trade.trade_type == TradeType.SELL
 
     def test_intra_file_duplicate_caught(self, app):
         content = (
@@ -91,8 +104,33 @@ class TestFormat1QualityChecks:
         assert report.rows_accepted == 2
         assert report.rows_rejected == 2
 
+    def test_total_rows_equals_data_lines(self, app):
+        """total_rows must equal number of data lines (not number of error dicts)."""
+        content = (
+            "TradeDate,AccountID,Ticker,Quantity,Price,TradeType,SettlementDate\n"
+            "2025-01-15,,AAPL,100,INVALID,HOLD,2025-01-17\n"  # 3 errors from 1 row
+        )
+        with app.app_context():
+            report = ingest(content)
+        # One data row — total_rows must be 1, not 3 (the number of error dicts)
+        assert report.total_rows == 1
+        assert report.rows_rejected == 1
+
 
 class TestFormat2QualityChecks:
+    """Format 2 is a trade file. Quality checks mirror Format 1 where applicable."""
+
+    def test_sell_fill_stored_with_negative_quantity(self, app):
+        content = (
+            "REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM\n"
+            "20250115|ACC001|TSLA|-150|35767.50|CUSTODIAN_A\n"
+        )
+        with app.app_context():
+            ingest(content)
+            trade = db.session.query(Trade).filter_by(ticker="TSLA").first()
+            assert trade.quantity == -150
+            assert trade.trade_type == TradeType.SELL
+
     def test_intra_file_duplicate_caught(self, app):
         content = (
             "REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM\n"
@@ -104,41 +142,17 @@ class TestFormat2QualityChecks:
         assert report.rows_accepted == 1
         assert len(report.warnings) == 1
 
-    def test_position_upsert_when_values_change(self, app):
-        original = (
-            "REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM\n"
-            "20250115|ACC001|AAPL|100|18550.00|CUSTODIAN_A\n"
-        )
-        updated = (
-            "REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM\n"
-            "20250115|ACC001|AAPL|110|20405.00|CUSTODIAN_A\n"  # corrected shares+value
-        )
-        with app.app_context():
-            ingest(original)
-            report = ingest(updated)
-
-        assert report.rows_upserted == 1
-        assert any("upsert" in w.lower() for w in report.warnings)
-
-        with app.app_context():
-            pos = db.session.query(Position).filter_by(
-                account_id="ACC001", ticker="AAPL", custodian_ref="CUSTODIAN_A"
-            ).first()
-            assert pos.shares == 110
-            assert pos.market_value == Decimal("20405.00")
-
-    def test_position_unchanged_skipped_with_warning(self, app):
+    def test_cross_file_duplicate_skipped(self, app):
         content = (
             "REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM\n"
             "20250115|ACC001|MSFT|50|21012.50|CUSTODIAN_A\n"
         )
         with app.app_context():
-            ingest(content)
-            report = ingest(content)  # reingest same data
-
-        assert report.rows_accepted == 0
-        assert report.rows_upserted == 0
-        assert any("unchanged" in w.lower() for w in report.warnings)
+            first = ingest(content)
+            assert first.rows_accepted == 1
+            second = ingest(content)
+            assert second.rows_accepted == 0
+            assert second.rows_skipped_duplicate == 1
 
 
 class TestFormat3QualityChecks:
@@ -186,6 +200,7 @@ class TestFormat3QualityChecks:
             report = ingest(updated)
 
         assert report.rows_upserted == 1
+        assert any("upsert" in w.lower() for w in report.warnings)
 
         with app.app_context():
             pos = db.session.query(Position).filter_by(
