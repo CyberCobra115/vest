@@ -15,9 +15,8 @@ def app():
 @pytest.fixture(autouse=True)
 def clean_db(app):
     """
-    Wipe all rows after every test via DELETE (not rollback) so that tests
-    committing within their own app_context() are also cleaned up.
-    The session-scoped app keeps the schema alive across all tests.
+    Wipe all rows after every test via DELETE so that tests committing
+    within their own app_context() are also cleaned up reliably.
     """
     with app.app_context():
         yield
@@ -33,7 +32,8 @@ def client(app):
 
 # ── Sample file content ──────────────────────────────────────────────────────
 
-FORMAT_1_CONTENT = """\
+# Both FORMAT_1 and FORMAT_2 are daily trade fills → trades table.
+TRADE_CSV_CONTENT = """\
 TradeDate,AccountID,Ticker,Quantity,Price,TradeType,SettlementDate
 2025-01-15,ACC001,AAPL,100,185.50,BUY,2025-01-17
 2025-01-15,ACC001,MSFT,50,420.25,BUY,2025-01-17
@@ -41,9 +41,8 @@ TradeDate,AccountID,Ticker,Quantity,Price,TradeType,SettlementDate
 2025-01-15,ACC003,TSLA,150,238.45,SELL,2025-01-17
 """
 
-# Format 2 is a trade file (pipe-delimited) per the spec.
-# Negative SHARES = SELL fill; positive = BUY fill.
-FORMAT_2_CONTENT = """\
+# Pipe-delimited trade fills. Negative SHARES = SELL fill.
+TRADE_PIPE_CONTENT = """\
 REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM
 20250115|ACC001|AAPL|100|18550.00|CUSTODIAN_A
 20250115|ACC001|MSFT|50|21012.50|CUSTODIAN_A
@@ -51,7 +50,9 @@ REPORT_DATE|ACCOUNT_ID|SECURITY_TICKER|SHARES|MARKET_VALUE|SOURCE_SYSTEM
 20250115|ACC003|TSLA|-150|35767.50|CUSTODIAN_A
 """
 
-FORMAT_3_CONTENT = """\
+# YAML position snapshot → positions table.
+# Each row is end-of-day total shares held, not a daily delta.
+POSITION_YAML_CONTENT = """\
 report_date: "20250115"
 positions:
   - account_id: "ACC001"
@@ -70,3 +71,8 @@ positions:
     market_value: 10710.00
     custodian_ref: "CUST_B_22345"
 """
+
+# Keep old names as aliases so tests can import either style.
+FORMAT_1_CONTENT = TRADE_CSV_CONTENT
+FORMAT_2_CONTENT = TRADE_PIPE_CONTENT
+FORMAT_3_CONTENT = POSITION_YAML_CONTENT

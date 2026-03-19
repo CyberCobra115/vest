@@ -1,20 +1,27 @@
 """
-Ingestion service: detect format → parse → quality check → persist.
-Returns a structured quality report regardless of outcome.
+Ingestion service: detect → parse → quality-check → persist.
 
-Quality checks performed:
-  - Field-level validation (done in parsers)
-  - Settlement date must be >= trade date (Format 1)
-  - Quantity non-zero check (Format 2 parser)
-  - Intra-file duplicate detection (same key appearing twice in one file)
-  - Cross-file duplicate detection (record already exists in DB)
-  - Position upsert: update market_value/shares if same date+account+ticker+custodian
+Format routing is data-driven via the parser registry in app/ingestion/__init__.py:
+  TRADE_PARSERS   → all formats that produce TradeRow  → trades table
+  POSITION_PARSERS → all formats that produce PositionRow → positions table
 
-Format routing (per spec):
-  FORMAT_1 → trades table  (CSV comma-delimited)
-  FORMAT_2 → trades table  (pipe-delimited; second trade format)
-  FORMAT_3 → positions table (YAML bank position file)
+Adding a 13th trade format means adding one parser module and one registry
+entry. Nothing in this file changes.
+
+Quality checks applied to all trade formats:
+  - Field-level validation (delegated to parser)
+  - SettlementDate >= TradeDate
+  - Intra-file duplicate detection
+  - Cross-file duplicate detection (DB lookup before insert)
+  - DB-level UniqueConstraint as final concurrency guard
+
+Quality checks applied to all position formats:
+  - Field-level validation (delegated to parser)
+  - Intra-file duplicate detection
+  - Upsert: update shares/market_value if the record already exists
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
@@ -23,11 +30,9 @@ from sqlalchemy import and_
 from sqlalchemy.exc import IntegrityError
 
 from app import db
-from app.ingestion.detector import FileFormat, detect_format
-from app.ingestion import format1, format2, format3
-from app.ingestion.format1 import Format1Row
-from app.ingestion.format2 import Format2Row
-from app.ingestion.format3 import Format3Row
+from app.ingestion import TRADE_PARSERS, POSITION_PARSERS
+from app.ingestion.base import TradeRow, PositionRow
+from app.ingestion.detector import FileFormat, detect
 from app.models import Position, SourceFormat, Trade, TradeType
 
 
@@ -58,68 +63,68 @@ class QualityReport:
 # ── Public entry point ────────────────────────────────────────────────────────
 
 def ingest(content: str) -> QualityReport:
-    fmt = detect_format(content)
+    fmt = detect(content)
 
-    if fmt == FileFormat.FORMAT_1:
-        return _ingest_format1(content)
-    elif fmt == FileFormat.FORMAT_2:
-        return _ingest_format2(content)
-    elif fmt == FileFormat.FORMAT_3:
-        return _ingest_format3(content)
-    else:
-        return QualityReport(
-            format_detected="UNKNOWN",
-            total_rows=0,
-            rows_accepted=0,
-            rows_rejected=0,
-            errors=[{"field": "file", "reason": "Could not detect file format. Check header row."}],
-        )
+    if fmt in TRADE_PARSERS:
+        return _ingest_trades(fmt, content)
+    if fmt in POSITION_PARSERS:
+        return _ingest_positions(fmt, content)
+
+    return QualityReport(
+        format_detected=FileFormat.UNKNOWN,
+        total_rows=0,
+        rows_accepted=0,
+        rows_rejected=0,
+        errors=[{"field": "file",
+                 "reason": "Could not detect file format. Check header row."}],
+    )
 
 
-# ── Format 1 ──────────────────────────────────────────────────────────────────
+# ── Trade ingestion (all trade formats share this path) ───────────────────────
 
-def _ingest_format1(content: str) -> QualityReport:
-    rows, parse_errors = format1.parse(content)
+def _ingest_trades(fmt: FileFormat, content: str) -> QualityReport:
+    parser = TRADE_PARSERS[fmt]
+    rows, parse_errors = parser.parse(content)
     warnings: list[str] = []
     errors: list[dict] = list(parse_errors)
 
-    # Count raw input rows (header excluded) before splitting valid/invalid.
-    # parse() already accounts for this via line numbers; approximate via
-    # non-blank data lines so total_rows is always >= accepted + rejected.
-    raw_row_count = sum(1 for line in content.splitlines() if line.strip()) - 1  # subtract header
+    # Count data lines (excluding header) before any filtering.
+    raw_row_count = sum(1 for ln in content.splitlines() if ln.strip()) - 1
 
-    # Quality check: settlement_date must be >= trade_date
-    clean: list[Format1Row] = []
+    # Quality check: SettlementDate must be >= TradeDate.
+    clean: list[TradeRow] = []
     for row in rows:
         if row.settlement_date < row.trade_date:
             errors.append({
                 "line": row._line_number,
                 "field": "SettlementDate",
                 "value": str(row.settlement_date),
-                "reason": f"SettlementDate {row.settlement_date} is before TradeDate {row.trade_date}",
+                "reason": (f"SettlementDate {row.settlement_date} is before "
+                           f"TradeDate {row.trade_date}"),
             })
-            continue
-        clean.append(row)
+        else:
+            clean.append(row)
 
-    # Quality check: intra-file duplicates
-    # Key uses the signed quantity so BUY 100 and SELL 100 of the same ticker
-    # on the same day are distinct (as they should be).
+    # Quality check: intra-file duplicates.
     seen: set[tuple] = set()
-    deduped: list[Format1Row] = []
+    deduped: list[TradeRow] = []
     for row in clean:
-        key = (row.trade_date, row.account_id, row.ticker, row.quantity, row.price, row.trade_type)
+        key = (row.trade_date, row.account_id, row.ticker,
+               row.quantity, row.price, row.trade_type)
         if key in seen:
             warnings.append(
                 f"Line {row._line_number}: duplicate trade skipped "
-                f"({row.account_id} {row.ticker} {row.trade_type} {abs(row.quantity)}@{row.price} on {row.trade_date})"
+                f"({row.account_id} {row.ticker} {row.trade_type} "
+                f"{abs(row.quantity)}@{row.price} on {row.trade_date})"
             )
-            continue
-        seen.add(key)
-        deduped.append(row)
+        else:
+            seen.add(key)
+            deduped.append(row)
 
-    # Persist — rely on DB unique constraint as the final guard against races.
-    accepted = 0
-    skipped = 0
+    # Persist — DB UniqueConstraint is the final guard against races.
+    source_fmt = SourceFormat(fmt.value)   # enum value names match 1-to-1
+    accepted = skipped = 0
+
     for row in deduped:
         exists = db.session.query(Trade).filter(
             and_(
@@ -134,8 +139,8 @@ def _ingest_format1(content: str) -> QualityReport:
 
         if exists:
             warnings.append(
-                f"Trade already exists in DB, skipped: "
-                f"{row.account_id} {row.ticker} {row.trade_type} {abs(row.quantity)}@{row.price} on {row.trade_date}"
+                f"Trade already in DB, skipped: {row.account_id} {row.ticker} "
+                f"{row.trade_type} {abs(row.quantity)}@{row.price} on {row.trade_date}"
             )
             skipped += 1
             continue
@@ -144,95 +149,11 @@ def _ingest_format1(content: str) -> QualityReport:
             trade_date=row.trade_date,
             account_id=row.account_id,
             ticker=row.ticker,
-            quantity=row.quantity,   # already signed by parser
+            quantity=row.quantity,
             price=row.price,
             trade_type=TradeType(row.trade_type),
             settlement_date=row.settlement_date,
-            source_format=SourceFormat.FORMAT_1,
-        ))
-        accepted += 1
-
-    try:
-        db.session.commit()
-    except IntegrityError:
-        db.session.rollback()
-        # Re-raise so caller gets a 500; the duplicate constraint caught a race.
-        raise
-
-    # Fix #5: total_rows = actual data lines, not count of error dicts.
-    # Fix #5: track rejected rows as input lines that failed, not error-dict count.
-    # A single bad row can produce multiple error dicts (e.g., missing field + invalid type).
-    rejected_row_lines = {e["line"] for e in errors if "line" in e and e["line"] is not None}
-    rejected_count = len(rejected_row_lines)
-
-    return QualityReport(
-        format_detected=FileFormat.FORMAT_1,
-        total_rows=raw_row_count,
-        rows_accepted=accepted,
-        rows_rejected=rejected_count,
-        rows_skipped_duplicate=skipped,
-        warnings=warnings,
-        errors=errors,
-    )
-
-
-# ── Format 2 ──────────────────────────────────────────────────────────────────
-# Format 2 is a trade file (pipe-delimited), per the spec:
-# "ingest files of two different formats for daily trades into a single table."
-
-def _ingest_format2(content: str) -> QualityReport:
-    rows, parse_errors = format2.parse(content)
-    warnings: list[str] = []
-    errors: list[dict] = list(parse_errors)
-
-    raw_row_count = sum(1 for line in content.splitlines() if line.strip()) - 1
-
-    # Quality check: intra-file duplicates.
-    # Key: (trade_date, account_id, ticker, signed_quantity, source_system)
-    seen: set[tuple] = set()
-    deduped: list[Format2Row] = []
-    for row in rows:
-        key = (row.trade_date, row.account_id, row.ticker, row.quantity, row.source_system)
-        if key in seen:
-            warnings.append(
-                f"Line {row._line_number}: duplicate trade skipped "
-                f"({row.account_id} {row.ticker} {row.trade_type} {abs(row.quantity)} on {row.trade_date})"
-            )
-            continue
-        seen.add(key)
-        deduped.append(row)
-
-    accepted = 0
-    skipped = 0
-    for row in deduped:
-        exists = db.session.query(Trade).filter(
-            and_(
-                Trade.trade_date == row.trade_date,
-                Trade.account_id == row.account_id,
-                Trade.ticker == row.ticker,
-                Trade.quantity == row.quantity,
-                Trade.trade_type == TradeType(row.trade_type),
-            )
-        ).first()
-
-        if exists:
-            warnings.append(
-                f"Trade already exists in DB, skipped: "
-                f"{row.account_id} {row.ticker} {row.trade_type} {abs(row.quantity)} on {row.trade_date}"
-            )
-            skipped += 1
-            continue
-
-        db.session.add(Trade(
-            trade_date=row.trade_date,
-            account_id=row.account_id,
-            ticker=row.ticker,
-            quantity=row.quantity,   # signed
-            price=row.price,
-            trade_type=TradeType(row.trade_type),
-            # Format 2 has no settlement date; use trade date as fallback.
-            settlement_date=row.trade_date,
-            source_format=SourceFormat.FORMAT_2,
+            source_format=source_fmt,
         ))
         accepted += 1
 
@@ -242,32 +163,34 @@ def _ingest_format2(content: str) -> QualityReport:
         db.session.rollback()
         raise
 
-    rejected_row_lines = {e["line"] for e in errors if "line" in e and e["line"] is not None}
-    rejected_count = len(rejected_row_lines)
+    # rejected = distinct bad lines (one bad row may produce multiple error dicts)
+    rejected_lines = {e["line"] for e in errors
+                      if "line" in e and e["line"] is not None}
 
     return QualityReport(
-        format_detected=FileFormat.FORMAT_2,
+        format_detected=fmt.value,
         total_rows=raw_row_count,
         rows_accepted=accepted,
-        rows_rejected=rejected_count,
+        rows_rejected=len(rejected_lines),
         rows_skipped_duplicate=skipped,
         warnings=warnings,
         errors=errors,
     )
 
 
-# ── Format 3 ──────────────────────────────────────────────────────────────────
+# ── Position ingestion (all position formats share this path) ─────────────────
 
-def _ingest_format3(content: str) -> QualityReport:
-    rows, parse_errors = format3.parse(content)
+def _ingest_positions(fmt: FileFormat, content: str) -> QualityReport:
+    parser = POSITION_PARSERS[fmt]
+    rows, parse_errors = parser.parse(content)
     warnings: list[str] = []
     errors: list[dict] = list(parse_errors)
 
     raw_row_count = len(rows) + len(errors)
 
-    # Quality check: intra-file duplicates
+    # Quality check: intra-file duplicates.
     seen: set[tuple] = set()
-    deduped: list[Format3Row] = []
+    deduped: list[PositionRow] = []
     for idx, row in enumerate(rows):
         key = (row.report_date, row.account_id, row.ticker, row.custodian_ref)
         if key in seen:
@@ -275,12 +198,12 @@ def _ingest_format3(content: str) -> QualityReport:
                 f"positions[{idx}]: duplicate entry skipped "
                 f"({row.account_id} {row.ticker} on {row.report_date})"
             )
-            continue
-        seen.add(key)
-        deduped.append(row)
+        else:
+            seen.add(key)
+            deduped.append(row)
 
-    accepted = 0
-    upserted = 0
+    accepted = upserted = 0
+
     for row in deduped:
         existing = db.session.query(Position).filter(
             and_(
@@ -292,9 +215,11 @@ def _ingest_format3(content: str) -> QualityReport:
         ).first()
 
         if existing:
-            if existing.shares != row.shares or existing.market_value != row.market_value:
+            if (existing.shares != row.shares
+                    or existing.market_value != row.market_value):
                 warnings.append(
-                    f"Position updated (upsert): {row.account_id} {row.ticker} on {row.report_date} — "
+                    f"Position updated (upsert): {row.account_id} {row.ticker} "
+                    f"on {row.report_date} — "
                     f"shares {existing.shares}→{row.shares}, "
                     f"market_value {existing.market_value}→{row.market_value}"
                 )
@@ -303,7 +228,8 @@ def _ingest_format3(content: str) -> QualityReport:
                 upserted += 1
             else:
                 warnings.append(
-                    f"Position unchanged, skipped: {row.account_id} {row.ticker} on {row.report_date}"
+                    f"Position unchanged, skipped: "
+                    f"{row.account_id} {row.ticker} on {row.report_date}"
                 )
             continue
 
@@ -314,14 +240,14 @@ def _ingest_format3(content: str) -> QualityReport:
             shares=row.shares,
             market_value=row.market_value,
             custodian_ref=row.custodian_ref,
-            source_format=SourceFormat.FORMAT_3,
+            source_format=SourceFormat(fmt.value),
         ))
         accepted += 1
 
     db.session.commit()
 
     return QualityReport(
-        format_detected=FileFormat.FORMAT_3,
+        format_detected=fmt.value,
         total_rows=raw_row_count,
         rows_accepted=accepted,
         rows_rejected=len(errors),
